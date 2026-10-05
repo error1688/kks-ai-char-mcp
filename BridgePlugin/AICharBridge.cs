@@ -1513,8 +1513,9 @@ namespace AICharBridge
                                 if (pArr.Count > 1 && pArr[1] is Dictionary<string, object>)
                                     foreach (var kv in (Dictionary<string, object>)pArr[1]) right[kv.Key] = kv.Value;
                             }
-                            MergeInto(left, face["pupilLeft"] as Dictionary<string, object>);
-                            MergeInto(right, face["pupilRight"] as Dictionary<string, object>);
+                            object pl, pr;
+                            MergeInto(left, face.TryGetValue("pupilLeft", out pl) ? pl as Dictionary<string, object> : null);
+                            MergeInto(right, face.TryGetValue("pupilRight", out pr) ? pr as Dictionary<string, object> : null);
 
                             var pupils = cf.custom.face.pupil;
                             if (pupils != null && pupils.Length >= 2)
@@ -2111,8 +2112,12 @@ namespace AICharBridge
                 Renderer r = rs[i];
                 if (r == null || !r.enabled || r is ParticleSystemRenderer) continue;
                 Bounds rb = r.bounds;
-                if (rb.size.magnitude > 3f) continue;                 // 明显异常的超大包围盒
-                if ((rb.center - root).magnitude > 2f) continue;      // 离角色太远
+                // ⚠ 不要用"体积异常大"过滤 T-pose 的身体网格：工作室角色双臂平举，
+                // 身体/裙子的包围盒宽度本来就有 3m+，滤掉它们就只剩头发饰品的小盒子，
+                // 取景框只有躯干高 —— compare 曾因此只拍到半身还照常打分（空帧幻影分数）。
+                // 离角色太远的过滤（下面这条）已经足够挡真正坏掉的数据。
+                if (rb.size.magnitude > 8f) continue;
+                if ((rb.center - root).magnitude > 2.5f) continue;
                 if (!has) { acc = rb; has = true; }
                 else acc.Encapsulate(rb);
                 used++;
@@ -3419,7 +3424,8 @@ namespace AICharBridge
             }
         }
 
-        private class ShotBox { public Img Img; public bool Settled; public int Attempts; public bool Frozen; public Exception Error; }
+        private class ShotBox { public Img Img; public bool Settled; public int Attempts; public bool Frozen; public Exception Error;
+            public Vector3 FocusPt; public float Dist; public float Aspect; }
 
         // 协程里的 yield 不能放进 try/catch（C# 限制），所以协程体内抛出的异常会直接散到 Unity、
         // TaskCompletionSource 永远不完成 —— HTTP 调用方只能干等 30~300 秒超时，还拿到误导性的
@@ -3529,6 +3535,8 @@ namespace AICharBridge
                 Vector3 dir = ResolveViewDir(target, view);
                 cam.transform.position = focusPt + dir * dist + Vector3.up * 0.02f;
                 cam.transform.LookAt(focusPt);
+                // 记录取景参数：空帧时（compare/fit 曾出现"空帧照打分"）靠它定位是取景飘了还是角色没了
+                box.FocusPt = focusPt; box.Dist = dist; box.Aspect = aspect;
 
                 // 稳定判定：连续两次粗指纹一致
                 string prev = null;
@@ -3632,6 +3640,19 @@ namespace AICharBridge
                 Img myIm = box.Img;
                 if (myIm == null) { tcs.SetException(new Exception("渲染失败")); yield break; }
 
+                // 空帧防护（/capture 有、这里曾经没有 —— 曾因此"对空帧打分"还返回 ok=true：
+                // 分数其实是参考图对纯背景打的，换装后分数纹丝不动就是这个原因）。
+                // 我的剪影覆盖率 < 1% 视为没拍到角色：不猜分数，直接报 UNKNOWN + 取景诊断。
+                if (myIm.Coverage < 0.01f)
+                {
+                    tcs.SetException(new Exception(string.Format(
+                        "渲染是空帧（我的剪影覆盖率 {0:P1}，参考 {1:P1}）—— 相机没对准角色，拒绝打分。" +
+                        "取景诊断：focusPt={2} dist={3:0.00} aspect={4:0.00}；请先用 /capture 确认角色可见再重试",
+                        myIm.Coverage, refIm != null ? refIm.Coverage : 0f,
+                        box.FocusPt.ToString(), box.Dist, box.Aspect)));
+                    yield break;
+                }
+
                 try
                 {
                 float wCore = 0.35f, wFull = 0.10f, wHist = 0.15f, wBand = 0.25f, wApp = 0.15f;
@@ -3682,6 +3703,8 @@ namespace AICharBridge
                     "weights", Json.Obj("iou_core", (double)wCore, "iou_full", (double)wFull,
                                         "color_hist", (double)wHist, "band_color", (double)wBand, "appearance", (double)wApp),
                     "settled", box.Settled, "settle_attempts", box.Attempts, "frozen_dynamics", box.Frozen,
+                    "my_coverage", (double)myIm.Coverage, "ref_coverage", refIm != null ? (double)refIm.Coverage : 0.0,
+                    "framing_diag", Json.Obj("focus_pt", box.FocusPt.ToString(), "dist", (double)box.Dist, "aspect", (double)box.Aspect),
                     "band_colors", Json.Obj("ref", new object[] { HexOf(rb[0]), HexOf(rb[1]), HexOf(rb[2]) },
                                             "mine", new object[] { HexOf(mb[0]), HexOf(mb[1]), HexOf(mb[2]) }),
                     "montage", abs,
@@ -3872,9 +3895,19 @@ namespace AICharBridge
                         try { WriteImg(mine, shotPathHair); shotImgs[iter] = mine; }
                         catch (Exception) { shotPathHair = null; }
                     }
+                    // 空帧防护：覆盖率过低说明相机没对准角色，这种候选分没有意义，跳过不计入榜单
+                    if (mine.Coverage < 0.01f)
+                    {
+                        board.Add(Json.Obj("iter", iter, "id", id,
+                            "color", combo[1] >= 0 ? colorCands[combo[1]] : null,
+                            "error", string.Format("空帧（覆盖率 {0:P1}），取景 dist={1:0.00}——该候选不计分",
+                                mine.Coverage, b2.Dist)));
+                        continue;
+                    }
                     board.Add(Json.Obj("iter", iter, "id", id,
                         "color", combo[1] >= 0 ? colorCands[combo[1]] : null,
                         "candidate_leaf", leafHair, "shot", shotPathHair, "frozen", b2.Frozen,
+                        "my_coverage", (double)mine.Coverage,
                         "total", (double)total, "iou_core", (double)iouCore, "iou_full", (double)iouFull,
                         "color_hist", (double)histSim, "band_color", (double)bandSim, "appearance", (double)appSim,
                         "ms", sw.ElapsedMilliseconds));
@@ -4258,6 +4291,12 @@ namespace AICharBridge
                 if (mine == null)
                 {
                     board.Add(Json.Obj("iter", i + 1, "candidate", Json.Write(cands[i]), "error", "渲染失败"));
+                    continue;
+                }
+                if (mine.Coverage < 0.01f)
+                {
+                    board.Add(Json.Obj("iter", i + 1, "candidate", Json.Write(cands[i]),
+                        "error", string.Format("空帧（覆盖率 {0:P1}）——该候选不计分", mine.Coverage)));
                     continue;
                 }
 
