@@ -158,6 +158,29 @@ accessories: [{type, id, colors[], slot?, parent?}]
            type: hair/head/face/neck/body/waist/leg/arm/hand（也可 1~10）
            基座卡常把 20 个饰品槽占满，加 clear_accessories:true 先清空
 
+—— 以上只是最常用的；face/body **还有一大片官方成员可直接写**（泛型反射按成员名写入）——
+face 共 39 个成员、body 共 25 个（完整清单：kks_params?what=fields）。常被忽略但很有用的：
+  face: whiteId/whiteBaseColor/whiteSubColor 眼白 | hlDownId/hlDownColor/hlDownX/hlDownY 下半高光
+        eyelineUpId/eyelineDownId/eyelineUpWeight 上下眼线分开调 | pupilX/pupilY/pupilWidth/pupilHeight 瞳孔位置与大小
+        foregroundEyebrow/foregroundEyes 描画顺序 | doubleTooth 八重齿 | detailId/detailPower 面部凹凸细节
+        cheekGlossPower/lipGlossPower 脸颊与唇光泽 | skinId 皮肤类型
+  body: typeBone 骨骼类型 | underhairId/underhairColor 体毛 | areolaSize 乳晕 | nipId/nipGlossPower
+        paintId[2]/paintColor[2]/paintLayoutId[2] 身体涂装两个槽 | skinGlossPower | nailGlossPower | sunburnId
+  parameter: 除上面的标量外，**人格问卷也支持**（传子对象，如
+        "attribute":{"majime":true,"friendly":true}、"awnser":{"sweet":true}、"denial":{"kiss":false}）；
+        还有 aggressive/diligence/kindness 三个标量
+
+异色瞳：face.pupil 传**数组** = 左右眼分别设（[左, 右]），或用 pupilLeft/pupilRight 显式指定：
+        "face":{"pupil":[{"baseColor":"#FF0000"},{"baseColor":"#00FF00"}]}
+        实测渲染确实左右不同色（isPupilSameSetting 是只读属性、不影响）
+
+多套服装：卡片有 4 套坐标（制服/体操服…）。clothes 默认只写"当前那套"（和游戏一致）：
+        "coordinate":1 → 只写第 1 套；"all_coordinates":true → 每套都写同一份
+        注意 clothesState（穿着状态）只有 9 项、不分坐标，所以写别的套数时不会动状态
+
+Vector 类型（饰品位移/花纹几何/发区微调）也支持，写法 [x,y,z] 或 {"x":..,"y":..}：
+        accessories[].addMove、clothes 的 tiling/offset/rotate、hair 的 pos/rot/scl、face 的 moleLayout
+
 滑条数组 shapeValueFace/Body 是逐元素写入：给一部分也能用，过长才会报错。""",
 
     "acceptance": """验收标准（照这个判"做完了没有"）：
@@ -280,9 +303,41 @@ verdict：>=0.62 close / >=0.48 partial / 否则 far —— 这个阈值只对�
 而"只差眼型"的真实信号只有 0.10 —— 噪声比信号大 100 倍，任何像素指标都失效。
 停掉物理后同参数重复渲染的差降到 0.04，搜索才有意义。所以看到 frozen:true 是正常的、也是期望的。""",
 
+    "plugins": """借道第三方制作插件（游戏内"修改器"能改更多，一半靠的就是这些插件）。
+
+**先问再借**：kks_plugins 看每个插件的 present（装没装）与 bridged_op（能不能通过本桥改）。
+present=false 时借道会明确报错，不会假装成功；bridgeable=false 表示只能用它自己的界面改。
+
+已接通的两个（都是零模型轮次、服务端直接改）：
+
+1) kks_material —— MaterialEditor：改**任意 shader 属性**（vanilla 数据模型里没有的维度）
+   op=list   列渲染器与材质名（实测本机 30 个渲染器）
+   op=props  列某材质的**真实属性名与当前值** ← 必须先用它，别猜属性名
+   op=set    改值：#RRGGBB=颜色 / 数字=浮点 / 路径=贴图 / true|false=关键字
+   实测皮肤 shader 是 Koikano/main_skin，属性形如 _overcolor1/_SpecularColor/_SpecularPower/_nip。
+   ⚠ 踩过的坑：MaterialAPI.SetColor(gameObject, materialName, ...) 对**角色材质一律返回 false**
+   （属性明明存在、值读回原样、渲染也不变）——它只认自己管理的材质副本。本桥改走
+   MaterialEditorCharaController.SetMaterialColorProperty，返回里的 saved_readback 才是真正存下的值。
+   验证方式：改完 kks_capture_views 再拍一张，md5 变了才算真生效（实测有效）。
+
+2) kks_bones —— KKSABMX(BonemodX)：**逐骨骼**缩放/位移/旋转，比 44 个形状滑条细得多
+   op=list 列骨骼名（实测 979 根；命名是小写 cf_j_head / cf_j_hips / cf_j_hand_L，
+           注意没有 cf_j_leg_L，腿是 cf_j_leg_L 之外的命名，先 list 再挑）
+   op=set  bones:[{name, scale:[x,y,z] 倍率(1=不变), length, position, rotation}]
+   实测：cf_j_head 放大 1.35 后渲染确实改变；不存在的骨骼名会被明确拒绝并提示先 list。
+
+**代价（必须知道）**：这些数据存在插件自己的扩展存块里（ExtSave）。借道生成的卡，
+在**没装对应插件的人**那里会退化成 vanilla 外观 —— 材质改动消失、骨骼改动消失。
+
+探测到但**没接**的（bridgeable=false，不要指望用本桥改）：
+  MoreAccessories（饰品槽位扩展，接口挂在 UI 实例上）、
+  KKPE / MovUrAcc（数据只在 ExtSave 里、由 UI 驱动，且 MovUrAcc 本机未加载）、
+  OverlayMods（叠图/纹身，控制器类型能探测到但未接）、MoreOutfits（套装槽位，同上）。
+""",
+
     "all": "",
 }
-HELP["all"] = (chr(10) * 2).join([HELP["verify"], HELP["workflow"], HELP["params"], HELP["acceptance"], HELP["pitfalls"], HELP["reference"], HELP["polish"]])
+HELP["all"] = (chr(10) * 2).join([HELP["verify"], HELP["workflow"], HELP["params"], HELP["acceptance"], HELP["pitfalls"], HELP["reference"], HELP["polish"], HELP["plugins"]])
 
 TOOLS = [
     {"name": "kks_status", "description": "查询恋活游戏状态（是否运行、当前场景、FPS、是否在工作室）",
@@ -360,6 +415,30 @@ TOOLS = [
          "label": {"type": "string", "description": "snapshot 时的备注（写进文件名）"},
          "id": {"type": "string", "description": "restore/drop 用哪个快照"},
          "name": {"type": "string", "description": "人物名关键字；snapshot 拍谁、restore 替换谁"}}}},
+    {"name": "kks_plugins", "description": "探测第三方制作插件（MaterialEditor / KKSABMX / KKPE / MoreAccessories / OverlayMods…）：返回 present（装没装）、bridged_op（能不能通过本桥改动）、assembly。**借道别的插件前必须先问它** —— present=false 时借道接口会明确报错；bridgeable=false 表示只能用它自己的界面改。加 assemblies 参数（如 assemblies=Mate）可列出匹配的已加载程序集，用于区分“没装”和“类型名猜错”",
+     "inputSchema": {"type": "object", "properties": {
+         "assemblies": {"type": "string", "description": "可选：列出名字含此串的已加载程序集（all=全部）"}}}},
+    {"name": "kks_material", "description": "借道 MaterialEditor 改**任意 shader 属性**（皮肤质感/金属度/自发光/肤色叠加层…），这是 vanilla 数据模型里根本没有的维度。op=list 列渲染器与材质名；op=props 列某材质的**真实属性名与当前值**（别猜 _Color —— 实测本机 Koikano/main_skin 用的是 _overcolor1/_SpecularPower 之类）；op=set 配 material+property+value 改值（#RRGGBB=颜色，数字=浮点，路径=贴图，true/false=关键字）。返回 saved_readback 是控制器里存下的值（不是 API 的返回值）。数据进 MaterialEditor 扩展块，别人没装就看不到效果",
+     "inputSchema": {"type": "object", "properties": {
+         "op": {"type": "string", "enum": ["list", "props", "set"], "description": "默认 list"},
+         "material": {"type": "string", "description": "材质名（op=props/set 必填，从 op=list 拿）"},
+         "property": {"type": "string", "description": "shader 属性名（从 op=props 拿真实名字）"},
+         "value": {"description": "新值：#RRGGBB 颜色 / 数字 / 贴图路径 / true|false 关键字"},
+         "object_type": {"type": "string", "enum": ["Character", "Clothing", "Accessory", "Hair"], "description": "默认 Character（身体/脸）；服装用 Clothing 并配 slot"},
+         "slot": {"type": "integer", "description": "object_type=Clothing/Accessory 时的部件号，默认 0"},
+         "name": {"type": "string", "description": "人物名关键字，可省略"}}}},
+    {"name": "kks_bones", "description": "借道 KKSABMX(BonemodX) **逐骨骼**缩放/位移/旋转 —— 比 44 个形状滑条细得多（能单独改某个肩、手指、脚踝）。op=list 列该角色全部骨骼名（实测 979 根，命名形如 cf_j_head / cf_j_hips / cf_j_hand_L，**是小写**）；op=set 传 bones:[{name, scale:[x,y,z] 倍率（1=不变）, length, position, rotation}]。数据进 ABMX 扩展块，别人没装就看不到效果",
+     "inputSchema": {"type": "object", "properties": {
+         "op": {"type": "string", "enum": ["list", "set"], "description": "默认 set"},
+         "bones": {"type": "array", "description": "op=set 时的骨骼列表",
+             "items": {"type": "object", "properties": {
+                 "name": {"type": "string", "description": "骨骼名，如 cf_j_head"},
+                 "scale": {"description": "缩放倍率 [x,y,z]，1=不变"},
+                 "length": {"type": "number", "description": "长度倍率，默认 1"},
+                 "position": {"description": "位移 [x,y,z]"},
+                 "rotation": {"description": "旋转（欧拉角）[x,y,z]"}}}},
+         "location": {"type": "string", "description": "ABMX 骨骼分类，默认自动取 Body 类"},
+         "name": {"type": "string", "description": "人物名关键字，可省略"}}}},
     {"name": "kks_launch", "description": "一条调用把游戏拉起来并等到桥就绪（已在跑就直接返回）。省掉手工启动+轮询；游戏路径可用环境变量 KKS_EXE 覆盖",
      "inputSchema": {"type": "object", "properties": {
          "wait_seconds": {"type": "integer", "description": "最多等多久，默认 180"}}}},
@@ -378,7 +457,7 @@ TOOLS = [
          "file": {"type": "string", "description": "文件名，可省略"}}}},
     {"name": "kks_help", "description": "查询使用说明（工作流 / 参数含义 / 验收标准 / 常见坑）。不确定怎么用或要按参考图生成时先问它",
      "inputSchema": {"type": "object", "properties": {
-         "topic": {"type": "string", "description": "verify 验收纪律（先跑 kks_audit！） | workflow 工作流 | params 参数 | acceptance 验收 | pitfalls 常见坑 | reference 按参考图校准 | polish 成品自检（穿模/皮肤/面部） | all 全部", "default": "workflow"}}}},
+         "topic": {"type": "string", "description": "verify 验收纪律（先跑 kks_audit！） | workflow 工作流 | params 参数（含 face 39 / body 25 全成员面、异色瞳、多套服装） | acceptance 验收 | pitfalls 常见坑 | reference 按参考图校准 | polish 成品自检（穿模/皮肤/面部） | plugins 借道第三方插件（MaterialEditor/ABMX 怎么用、代价是什么） | all 全部", "default": "workflow"}}}},
     {"name": "kks_activity", "description": "查看 AI 桥最近 50 条操作记录（同时在游戏画面左上角 HUD 和 UserData/AICharBridge/activity.log 中可见，供用户监督）",
      "inputSchema": {"type": "object", "properties": {}}},
 ]
@@ -457,6 +536,16 @@ def call_tool(name, args):
         return bridge("POST", "/fit", body=a, timeout=300)
     if name == "kks_audit":
         return bridge("GET", "/audit", timeout=120)
+    if name == "kks_plugins":
+        a = args or {}
+        q = ""
+        if a.get("assemblies"):
+            q = "?assemblies=" + urllib.parse.quote(str(a["assemblies"]))
+        return bridge("GET", "/plugins" + q, timeout=60)
+    if name == "kks_material":
+        return bridge("POST", "/material", body=dict(args or {}), timeout=120)
+    if name == "kks_bones":
+        return bridge("POST", "/bones", body=dict(args or {}), timeout=120)
     if name == "kks_txn":
         return bridge("POST", "/txn", body=dict(args or {}), timeout=120)
     if name == "kks_launch":

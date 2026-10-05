@@ -180,7 +180,8 @@ namespace AICharBridge
         private static readonly string[] RouteManifest = new string[] {
             "/status", "/characters", "/presets", "/options", "/options_ids", "/activity", "/inspect", "/params", "/live", "/clear", "/audit", "/txn", "/probe",
             "/doctor", "/capture", "/reference", "/compare", "/fit", "/selftest",
-            "/focus", "/generate", "/screenshot" };
+            "/focus", "/generate", "/screenshot",
+            "/plugins", "/material", "/bones" };
 
         private static bool RouteExists(string path)
         {
@@ -223,6 +224,9 @@ namespace AICharBridge
                 if (path == "/focus" && method == "POST") return Resp(200, FocusCamera(body));
                 if (path == "/generate" && method == "POST") return Resp(200, Generate(body));
                 if (path == "/screenshot" && method == "POST") return Resp(200, Screenshot(body));
+                if (path == "/plugins" && method == "GET") return Resp(200, Plugins(query));
+                if (path == "/material" && method == "POST") return Resp(200, MaterialOp(body));
+                if (path == "/bones" && method == "POST") return Resp(200, Bones(body));
                 return Resp(404, Json.Obj("ok", false, "error", "unknown endpoint " + method + " " + path));
             }
             catch (Exception e)
@@ -443,14 +447,40 @@ namespace AICharBridge
                     }
                     try
                     {
-                        ChaFileCoordinate co = cf.coordinate[cf.status.coordinateType];
-                        if (co != null) FlattenInto(cloth, co.clothes, "", 0);
+                        int cci = cf.status != null ? cf.status.coordinateType : 0;
+                        if (cci < 0 || cci >= cf.coordinate.Length) cci = 0;
+                        ChaFileCoordinate co = cf.coordinate[cci];
+                        if (co != null)
+                        {
+                            FlattenInto(cloth, co.clothes, "", 0);
+                            if (co.clothes != null)
+                            {
+                                // 每个服装部位的 colorInfo 明细也摊平（颜色/花纹/平铺/偏移/旋转），
+                                // 否则"衣服颜色到底能不能调"这件事在参数清单里看不到——而它正是踩过的坑。
+                                for (int pi = 0; pi < co.clothes.parts.Length && pi < ClothesPartNames.Length; pi++)
+                                {
+                                    ChaFileClothes.PartsInfo cp = co.clothes.parts[pi];
+                                    if (cp == null) continue;
+                                    FlattenInto(cloth, cp, "parts[" + pi + "](" + ClothesPartNames[pi] + ").", 0);
+                                }
+                            }
+                            // 饰品槽也列出来（type/id/颜色/偏移/父骨骼），这是编辑器能改而工具之前没暴露的一大块
+                            if (co.accessory != null && co.accessory.parts != null)
+                            {
+                                for (int si = 0; si < co.accessory.parts.Length; si++)
+                                {
+                                    ChaFileAccessory.PartsInfo ap = co.accessory.parts[si];
+                                    if (ap == null) continue;
+                                    FlattenInto(cloth, ap, "accessory[" + si + "].", 0);
+                                }
+                            }
+                        }
                     }
                     catch (Exception) { }
                     return Json.Obj("file", Path.GetFileName(path),
                         "face_fields", face.Count, "body_fields", body.Count, "hair_fields", hair.Count,
-                        "clothes_fields", cloth.Count,
-                        "face", face, "body", body, "hair", hair);
+                        "clothes_fields", cloth.Count, "coordinate_count", cf.coordinate != null ? cf.coordinate.Length : 0,
+                        "face", face, "body", body, "hair", hair, "clothes", cloth);
                 });
             }
 
@@ -1467,16 +1497,41 @@ namespace AICharBridge
                     if (face != null)
                     {
                         // pupil 作用于双眼，其余键照常应用到 face 本体（此前写成 if/else，导致带 pupil 时其他五官参数被丢弃）
-                        if (face.ContainsKey("pupil"))
+                        // 异色瞳：pupil 传数组 = 左右眼分别设；也可用 pupilLeft/pupilRight 显式指定。
+                        // 数据模型里双眼本来就各自独立（face.pupil[2]），同一份数据写两只眼只是"同色"的便捷写法。
+                        if (face.ContainsKey("pupil") || face.ContainsKey("pupilLeft") || face.ContainsKey("pupilRight"))
                         {
-                            var pv = face["pupil"] as Dictionary<string, object>;
-                            if (pv != null && cf.custom.face.pupil != null)
+                            var left = new Dictionary<string, object>();
+                            var right = new Dictionary<string, object>();
+                            var pv = face.ContainsKey("pupil") ? face["pupil"] as Dictionary<string, object> : null;
+                            var pArr = face.ContainsKey("pupil") ? face["pupil"] as List<object> : null;
+                            if (pv != null) { foreach (var kv in pv) { left[kv.Key] = kv.Value; right[kv.Key] = kv.Value; } }
+                            else if (pArr != null)
                             {
-                                for (int e = 0; e < cf.custom.face.pupil.Length; e++)
-                                    applier.Apply(cf.custom.face.pupil[e], pv, "face.pupil[" + e + "]");
+                                if (pArr.Count > 0 && pArr[0] is Dictionary<string, object>)
+                                    foreach (var kv in (Dictionary<string, object>)pArr[0]) left[kv.Key] = kv.Value;
+                                if (pArr.Count > 1 && pArr[1] is Dictionary<string, object>)
+                                    foreach (var kv in (Dictionary<string, object>)pArr[1]) right[kv.Key] = kv.Value;
                             }
+                            MergeInto(left, face["pupilLeft"] as Dictionary<string, object>);
+                            MergeInto(right, face["pupilRight"] as Dictionary<string, object>);
+
+                            var pupils = cf.custom.face.pupil;
+                            if (pupils != null && pupils.Length >= 2)
+                            {
+                                if (left.Count > 0) applier.Apply(pupils[0], left, "face.pupil.L");
+                                if (right.Count > 0) applier.Apply(pupils[1], right, "face.pupil.R");
+                                // 只有左右真的不同才关掉"双眼同设定"，否则会在制作器里把左右联动弄坏
+                                if (!SamePupilSetting(left, right))
+                                {
+                                    bool okIps = applier.NoteMember(cf.custom.face, "isPupilSameSetting", false);
+                                    if (!okIps) applier.Skip("face.isPupilSameSetting", "该字段不可写，异色瞳可能不生效");
+                                }
+                            }
+                            else applier.Skip("face.pupil", "瞳数据不可用");
+
                             var rest = new Dictionary<string, object>(face);
-                            rest.Remove("pupil");
+                            rest.Remove("pupil"); rest.Remove("pupilLeft"); rest.Remove("pupilRight");
                             if (rest.Count > 0) applier.Apply(cf.custom.face, rest, "face");
                         }
                         else applier.Apply(cf.custom.face, face, "face");
@@ -1505,30 +1560,51 @@ namespace AICharBridge
             }
             if (req.ContainsKey("clothes") && cf.coordinate != null && cf.coordinate.Length > 0)
             {
-                int ci = cf.status != null ? cf.status.coordinateType : 0;
-                if (ci < 0 || ci >= cf.coordinate.Length) ci = 0;
-                ChaFileCoordinate coord = cf.coordinate[ci];
-                if (coord != null && coord.clothes != null && coord.clothes.parts != null)
+                int cur = cf.status != null ? cf.status.coordinateType : 0;
+                if (cur < 0 || cur >= cf.coordinate.Length) cur = 0;
+                // 写哪几套坐标：默认只写当前那套（和游戏一致）。
+                //   "coordinate": N   -> 只写第 N 套（0 起）
+                //   "all_coordinates": true -> 每套都写同一份（做"全部套装统一配色"很方便）
+                // 注意 clothesState（穿着状态）存在 ChaFileStatus 里、只有 9 项、不分坐标，
+                // 所以状态只对"当前那套"有意义——写别的套数时不动状态，避免把当前穿着改坏。
+                var coordTargets = new List<int>();
+                double? coReq = Num(req, "coordinate");
+                if (coReq.HasValue)
                 {
-                    Dictionary<string, object> cl = req["clothes"] as Dictionary<string, object>;
+                    int want = (int)coReq.Value;
+                    if (want >= 0 && want < cf.coordinate.Length) coordTargets.Add(want);
+                    else applier.Skip("coordinate", "坐标索引越界（合法 0~" + (cf.coordinate.Length - 1) + "）");
+                }
+                else if (Bool(req, "all_coordinates", false))
+                {
+                    for (int i = 0; i < cf.coordinate.Length; i++) coordTargets.Add(i);
+                }
+                else coordTargets.Add(cur);
+
+                Dictionary<string, object> cl = req["clothes"] as Dictionary<string, object>;
+                foreach (int ci in coordTargets)
+                {
+                    ChaFileCoordinate coord = cf.coordinate[ci];
+                    if (coord == null || coord.clothes == null || coord.clothes.parts == null) continue;
+                    string cpfx = coordTargets.Count > 1 ? "clothes[coord" + ci + "]." : "clothes.";
                     foreach (KeyValuePair<string, object> kv in cl)
                     {
                         int idx = ClothesIndex(kv.Key);
-                        if (idx < 0 || idx >= coord.clothes.parts.Length) { applier.Skip("clothes." + kv.Key, "无此部位"); continue; }
+                        if (idx < 0 || idx >= coord.clothes.parts.Length) { applier.Skip(cpfx + kv.Key, "无此部位"); continue; }
                         var part = kv.Value as Dictionary<string, object>;
                         if (part == null) continue;
                         double? wantId = Num(part, "id");
                         // 服装部位 0~7 对应分类 105~112
-                        if (wantId.HasValue && !ValidatePartId(applier, "clothes." + kv.Key + ".id", (int)wantId.Value, 105 + idx)) continue;
-                        applier.Apply(coord.clothes.parts[idx], part, "clothes." + kv.Key);
+                        if (wantId.HasValue && !ValidatePartId(applier, cpfx + kv.Key + ".id", (int)wantId.Value, 105 + idx)) continue;
+                        applier.Apply(coord.clothes.parts[idx], part, cpfx + kv.Key);
                         // ⚠ shoes 是**两个部件**：parts[7]=shoes_inner、parts[8]=shoes_outer，
                         // 外观（看得见的那双鞋）在 shoes_outer。只写 parts[7] 时数据变了但外观不变 ——
                         // 实测换 1/5/8/21 四个鞋 id 渲染出的是同一双基座卡的鞋。
                         if (idx == 7 && coord.clothes.parts.Length > 8)
-                            applier.Apply(coord.clothes.parts[8], part, "clothes." + kv.Key + "(outer)");
+                            applier.Apply(coord.clothes.parts[8], part, cpfx + kv.Key + "(outer)");
                         // 关键：服装数据对但不等于会显示——官方预设卡里很多部位存的是"已脱"状态。
                         // 这里把被设置的部位同步改成"穿着"，否则生成出来的人会是半裸的。
-                        SetClothesState(applier, cf, idx, kv.Key, part);
+                        if (ci == cur) SetClothesState(applier, cf, idx, kv.Key, part);
                     }
                 }
             }
@@ -1587,6 +1663,26 @@ namespace AICharBridge
             return Json.Obj("ok", true, "saved", dest, "base", basePath, "verified", verified,
                 "loaded", loaded, "note", note, "replaced_same_name", replaced, "scene_chars", sceneCount,
                 "applied", applier.Applied, "skipped", applier.Skipped);
+        }
+
+        // 把小字典并入大字典（后写的覆盖先写的）；用于 pupilLeft/pupilRight 覆盖 pupil 的公共部分
+        private static void MergeInto(Dictionary<string, object> dst, Dictionary<string, object> src)
+        {
+            if (src == null) return;
+            foreach (KeyValuePair<string, object> kv in src) dst[kv.Key] = kv.Value;
+        }
+
+        // 左右瞳孔设定是否等价：逐叶比较，避免"值相同却把关掉"或"值不同却没关"
+        private static bool SamePupilSetting(Dictionary<string, object> left, Dictionary<string, object> right)
+        {
+            if (left.Count != right.Count) return false;
+            foreach (KeyValuePair<string, object> kv in left)
+            {
+                object o;
+                if (!right.TryGetValue(kv.Key, out o)) return false;
+                if (Json.Write(kv.Value) != Json.Write(o)) return false;
+            }
+            return true;
         }
 
         private void ApplySection(Applier applier, Dictionary<string, object> req, string key, object target)
@@ -1791,6 +1887,10 @@ namespace AICharBridge
                     return -1;
             }
         }
+
+        // 服装部位名（索引与 ClothesIndex 一致；parts[8] 是鞋子外观件，见 shoes 的说明）
+        private static readonly string[] ClothesPartNames = new string[] {
+            "top", "bot", "bra", "shorts", "gloves", "panst", "socks", "shoes", "shoes_outer" };
 
         private static int ClothesIndex(string key)
         {
@@ -4315,6 +4415,71 @@ namespace AICharBridge
             yield return null;
         }
 
+        // ================= /plugins：报告第三方制作插件的可用性 =================
+        // 借道别的插件前先问它"在不在、版本多少"，避免把"未安装"错当成"改了没效果"。
+        private object Plugins(string query)
+        {
+            var list = PluginBridge.Availability();
+            int present = 0;
+            foreach (object o in list) if (System.Convert.ToBoolean(((Dictionary<string, object>)o)["present"])) present++;
+            var res = Json.Obj("ok", true, "present_count", present, "checked", list.Count, "plugins", list,
+                "note", "present=false 表示该插件没装/没加载，借道它的接口会明确报错而不会假装成功；" +
+                        "借道产生的数据存在插件的扩展块里，别人没装就看不到效果");
+            // 类型名可能猜错：把实际加载的程序集列出来，方便区分"没装"和"名字不对"
+            string filter = QueryValue(query, "assemblies");
+            if (!string.IsNullOrEmpty(filter))
+            {
+                var names = new List<object>();
+                try
+                {
+                    Assembly[] asms = AppDomain.CurrentDomain.GetAssemblies();
+                    for (int i = 0; i < asms.Length; i++)
+                    {
+                        string an = asms[i].GetName().Name;
+                        if (filter == "all" || an.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0) names.Add(an);
+                    }
+                }
+                catch (Exception) { }
+                res["loaded_assemblies"] = names;
+                res["loaded_assemblies_filter"] = filter;
+            }
+            return res;
+        }
+
+        // ================= /material：借道 MaterialEditor 改任意 shader 属性 =================
+        private object MaterialOp(string body)
+        {
+            Dictionary<string, object> req = Json.Parse(body) as Dictionary<string, object>;
+            if (req == null) req = new Dictionary<string, object>();
+            string name = Str(req, "name", null);
+            return RunOnMain(delegate
+            {
+                string found;
+                ChaControl target = FindStudioChar(name, out found);
+                if (target == null) throw new Exception("场景里没有角色（先用 load:true 加进工作室）");
+                object r = PluginBridge.MaterialOp(target, req);
+                AddActivity("· /material " + Str(req, "op", "list") + " on " + found);
+                return r;
+            });
+        }
+
+        // ================= /bones：借道 KKSABMX 逐骨骼微调 =================
+        private object Bones(string body)
+        {
+            Dictionary<string, object> req = Json.Parse(body) as Dictionary<string, object>;
+            if (req == null) req = new Dictionary<string, object>();
+            string name = Str(req, "name", null);
+            return RunOnMain(delegate
+            {
+                string found;
+                ChaControl target = FindStudioChar(name, out found);
+                if (target == null) throw new Exception("场景里没有角色（先用 load:true 加进工作室）");
+                object r = PluginBridge.BonesOp(target, req);
+                AddActivity("· /bones " + Str(req, "op", "set") + " on " + found);
+                return r;
+            });
+        }
+
         // ================= /selftest：能力锁 + 端到端自测 =================
         private object SelfTest()
         {
@@ -4341,7 +4506,8 @@ namespace AICharBridge
             string[] mustHave = new string[] { "Silhouette", "SilhouetteFlood", "Normalize", "Iou", "BandColors",
                 "OffscreenShot", "SplitPanels", "PanelSignature",
                 "CropRegion", "FreezeDynamics", "MontageToFile", "DiscoverShapeTables",
-                "Audit", "Txn", "EnsureDressed", "ClearScene", "StudioCharCount" };
+                "Audit", "Txn", "EnsureDressed", "ClearScene", "StudioCharCount",
+                "PluginBridge", "MaterialOp", "BonesOp", "TryParseColor", "ToFloats", "ClothesPartNames" };
             string src = "";
             try { src = File.ReadAllText(typeof(AICharBridge).Assembly.Location); } catch (Exception) { }
             var lostImpl = new List<object>();
@@ -4549,6 +4715,19 @@ namespace AICharBridge
                 hardFail.Add("capture");
             }
 
+            // 借道用的第三方插件（软检查：装了能多用一层能力，没装不影响通道本身）
+            List<object> plugins = PluginBridge.Availability();
+            int bridged = 0, present = 0;
+            foreach (object o in plugins)
+            {
+                var pd = o as Dictionary<string, object>;
+                if (pd == null) continue;
+                if (System.Convert.ToBoolean(pd["present"])) present++;
+                if (System.Convert.ToBoolean(pd["bridgeable"])) bridged++;
+            }
+            checks.Add(Json.Obj("name", "third_party_plugins", "ok", true, "hard", false,
+                "detail", "检测到 " + present + " 个，其中 " + bridged + " 个已可供本桥调用（详见 /plugins）"));
+
             bool ok = hardFail.Count == 0;
             var cfg = Json.Obj("port", _port.Value, "game_root", GameRoot,
                 "hud", _hud.Value, "hud_key", _hudKey.Value.ToString(),
@@ -4557,6 +4736,7 @@ namespace AICharBridge
 
             return Json.Obj("kind", ok ? "ok" : "fail", "ok", ok,
                 "checks", checks, "provenance", prov, "config", cfg,
+                "third_party_plugins", plugins,
                 "failed", hardFail.ToArray(),
                 "note", ok ? "通道正常（kind=ok 即可用）" : "有硬性检查未通过，见 failed");
         }
@@ -4681,6 +4861,13 @@ namespace AICharBridge
         // smooth_skin: 一键关掉会让皮肤显得"不平整/有肌肉感"的细节层
         private static void ApplySmoothSkin(Applier applier, Dictionary<string, object> req, ChaFileBody body, ChaFileFace face)
         {
+            // ⚠ 这里以前**无条件**清掉面部的 detailPower 并夹住脸颊/唇光泽 —— 而官方卡
+            // face.detailPower 实测是 0.449（脸部是有凹凸细节的），于是每生成一次就把官方脸
+            // 的质感抹平一次；而且它跑在通用 apply 之后，用户显式传的 detailPower 也会被覆盖。
+            // 这与本项目的原则（基座卡是官方成品，只改参考图明确要求的）冲突。
+            // 现在整段都受 smooth_skin 控制：不开就完全继承官方值。
+            if (!Bool(req, "smooth_skin", false)) return;
+
             if (face != null)
             {
                 face.detailPower = 0f;                        // 面部细节贴图：高了会显脏/不平
@@ -4688,7 +4875,6 @@ namespace AICharBridge
                 face.lipGlossPower = Mathf.Clamp(face.lipGlossPower, 0.2f, 0.6f);
             }
             if (body == null) return;
-            if (!Bool(req, "smooth_skin", false)) return;
             body.detailPower = 0f;
             body.drawAddLine = false;
             body.skinGlossPower = Mathf.Clamp(body.skinGlossPower, 0.15f, 0.5f);
@@ -4696,7 +4882,7 @@ namespace AICharBridge
             body.sunburnId = 0;
             body.sunburnColor = new Color(1f, 1f, 1f, 1f);
             if (body.paintColor != null) for (int i = 0; i < body.paintColor.Length; i++) body.paintColor[i] = new Color(1f, 1f, 1f, 1f);
-            applier.Note("smooth_skin", "已关闭 detailPower/drawAddLine/paint/sunburn，并收敛光泽度");
+            applier.Note("smooth_skin", "已关闭面部/身体 detailPower、drawAddLine、paint、sunburn，并收敛光泽度");
         }
 
         // ================= 工具 ============
@@ -4734,6 +4920,17 @@ namespace AICharBridge
         }
 
         // "#RGB" / "#RRGGBB" / "#RRGGBBAA" -> Color，非法值给出可读原因
+        // 不抛异常的颜色解析（用于"这个字符串到底是颜色还是贴图路径"的判别）
+        private static bool TryParseColor(string s, out Color c)
+        {
+            c = Color.white;
+            if (string.IsNullOrEmpty(s)) return false;
+            string t = s.Trim();
+            if (!t.StartsWith("#", StringComparison.Ordinal)) return false;   // 贴图路径不会以 # 开头
+            try { c = ParseColorValue(t); return true; }
+            catch (Exception) { return false; }
+        }
+
         internal static Color ParseColorValue(object v)
         {
             string s = v as string;
@@ -4856,6 +5053,22 @@ namespace AICharBridge
                 Applied.Add(Json.Obj("item", what, "value", value));
             }
 
+            // 反射写一个成员并记入 applied；写不了返回 false（调用方决定是静默跳过还是记 skip）
+            public bool NoteMember(object target, string name, object value)
+            {
+                if (target == null) return false;
+                const BindingFlags F = BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase;
+                try
+                {
+                    PropertyInfo p = target.GetType().GetProperty(name, F);
+                    if (p != null && p.CanWrite) { p.SetValue(target, value, null); Note(p.Name, value); return true; }
+                    FieldInfo f = target.GetType().GetField(name, F);
+                    if (f != null) { f.SetValue(target, value); Note(f.Name, value); return true; }
+                }
+                catch (Exception e) { Skipped.Add(Json.Obj("item", name, "reason", e.Message)); }
+                return false;
+            }
+
             private bool ApplyMember(object target, string name, object value, string prefix)
             {
                 if (target == null || value == null) return false;
@@ -4864,6 +5077,18 @@ namespace AICharBridge
                 try
                 {
                     PropertyInfo p = t.GetProperty(name, F);
+                    // 嵌套对象（人格问卷 attribute/awnser/denial…）：传子字典时递归写进现有实例。
+                    // 只对引用类型递归 —— 值类型（Vector3 等）拿到的是副本，写进去不会生效。
+                    if (p != null && value is Dictionary<string, object> && !p.PropertyType.IsValueType
+                        && p.PropertyType != typeof(string) && !p.PropertyType.IsArray)
+                    {
+                        object cur = p.CanRead ? p.GetValue(target, null) : null;
+                        if (cur != null)
+                        {
+                            Apply(cur, (Dictionary<string, object>)value, prefix + "." + name);
+                            return true;
+                        }
+                    }
                     if (p != null && p.CanWrite)
                     {
                         // 数组类（如 shapeValueFace/Body 滑条）逐元素写入：部分数组也能用，不会把原有数据整段替换掉
@@ -4995,8 +5220,71 @@ namespace AICharBridge
                     for (int i = 0; i < arr.Count; i++) fs[i] = (float)System.Convert.ToDouble(arr[i], CultureInfo.InvariantCulture);
                     return fs;
                 }
+                // Vector2/3/4：饰品位移(addMove)、花纹平铺/偏移/旋转(tiling/offset/rotate)、
+                // 发区微调(pos/rot/scl)、瞳孔渐变都用它们。接受 {"x":..,"y":..} 或 [x,y,z]。
+                if (type == typeof(Vector2)) { float[] v = ToFloats(value, 2); return new Vector2(v[0], v[1]); }
+                if (type == typeof(Vector3)) { float[] v = ToFloats(value, 3); return new Vector3(v[0], v[1], v[2]); }
+                if (type == typeof(Vector4)) { float[] v = ToFloats(value, 4); return new Vector4(v[0], v[1], v[2], v[3]); }
+                // bool[]：服装 hideOpt（帽兜等可选件开关）、饰品 showAccessory（每槽显示开关）
+                if (type == typeof(bool[]))
+                {
+                    var arr = value as List<object>;
+                    if (arr == null) throw new Exception("需要数组");
+                    bool[] bs = new bool[arr.Count];
+                    for (int i = 0; i < arr.Count; i++)
+                        bs[i] = arr[i] is bool ? (bool)arr[i] : System.Convert.ToDouble(arr[i]) != 0.0;
+                    return bs;
+                }
+                // Vector3[]：饰品 addMove 是数组元素
+                if (type == typeof(Vector3[]))
+                {
+                    var arr = value as List<object>;
+                    if (arr == null) throw new Exception("需要数组");
+                    Vector3[] vs = new Vector3[arr.Count];
+                    for (int i = 0; i < arr.Count; i++)
+                    {
+                        float[] v = ToFloats(arr[i], 3);
+                        vs[i] = new Vector3(v[0], v[1], v[2]);
+                    }
+                    return vs;
+                }
+                if (type == typeof(Color[]))
+                {
+                    var arr = value as List<object>;
+                    if (arr == null) throw new Exception("需要数组");
+                    Color[] cs = new Color[arr.Count];
+                    for (int i = 0; i < arr.Count; i++) cs[i] = ParseColor(arr[i]);
+                    return cs;
+                }
                 if (type.IsEnum) return Enum.Parse(type, Math.Round(System.Convert.ToDouble(value)).ToString());
                 throw new Exception("不支持的目标类型 " + type.Name);
+            }
+
+            // {"x":1,"y":2,"z":3} 或 [1,2,3] 或单个数（补零） -> float[n]
+            private static float[] ToFloats(object value, int n)
+            {
+                float[] outv = new float[n];
+                var d = value as Dictionary<string, object>;
+                if (d != null)
+                {
+                    string[] keys = new string[] { "x", "y", "z", "w" };
+                    for (int i = 0; i < n; i++)
+                    {
+                        object o;
+                        if (!d.TryGetValue(keys[i], out o)) continue;
+                        outv[i] = (float)System.Convert.ToDouble(o, CultureInfo.InvariantCulture);
+                    }
+                    return outv;
+                }
+                var arr = value as List<object>;
+                if (arr != null)
+                {
+                    for (int i = 0; i < n && i < arr.Count; i++)
+                        outv[i] = (float)System.Convert.ToDouble(arr[i], CultureInfo.InvariantCulture);
+                    return outv;
+                }
+                outv[0] = (float)System.Convert.ToDouble(value, CultureInfo.InvariantCulture);
+                return outv;
             }
 
             private Color ParseColor(object v)
@@ -5182,6 +5470,470 @@ namespace AICharBridge
                     }
                 }
                 sb.Append('"');
+            }
+        }
+
+        // ================= 借道第三方制作插件 =================
+        //
+        // 为什么不硬引用它们的 DLL：没装那个插件的机器上会直接编译失败。
+        // 所以全部走"运行时按类型名反射"：装了就用它的公开 API，没装就在 /plugins 里如实报
+        // "未安装"，绝不假装成功（本项目的一贯纪律：UNKNOWN 不等于 PASS）。
+        //
+        // 代价（必须让使用者知道）：这些插件的数据都存在 KKS_ExtensibleSaveFormat 的扩展块里，
+        // 所以借道生成的卡，在没装对应插件的人那里会退化成 vanilla 外观。
+        private static class PluginBridge
+        {
+            private static readonly Dictionary<string, Type> _types = new Dictionary<string, Type>();
+
+            public static Type Find(string fullName)
+            {
+                lock (_types)
+                {
+                    Type cached;
+                    if (_types.TryGetValue(fullName, out cached)) return cached;
+                    Type found = null;
+                    try
+                    {
+                        Assembly[] asms = AppDomain.CurrentDomain.GetAssemblies();
+                        for (int i = 0; i < asms.Length && found == null; i++)
+                        {
+                            try { found = asms[i].GetType(fullName, false); }
+                            catch (Exception) { }
+                        }
+                    }
+                    catch (Exception) { }
+                    _types[fullName] = found;
+                    return found;
+                }
+            }
+
+            // 类型名 / 已接的端点 / 说明。bridged 为 null = 只探测到、还没接（如实标注，
+            // 免得把"检测到插件"误读成"这个能力已经能用"）。
+            public static readonly string[][] Known = new string[][] {
+                new string[] { "MaterialEditorAPI.MaterialAPI", "/material", "改任意 shader 属性（颜色/浮点/关键字）" },
+                new string[] { "KKABMX.Core.BoneController", "/bones", "逐骨骼缩放/位移/旋转" },
+                new string[] { "KKABMX.Core.BoneModifier", "/bones", null },
+                new string[] { "KKABMX.Core.BoneModifierData", "/bones", null },
+                new string[] { "KK_Plugins.MaterialEditor.MaterialEditorCharaController", "/material", "真正能改角色材质并持久化的入口" },
+                new string[] { "MoreAccessoriesKOI.MoreAccessories", null, "饰品槽位扩展；接口挂在 UI 实例上，暂未接" },
+                new string[] { "KoiSkinOverlayX.KoiSkinOverlayController", null, "身体/脸叠图（纹身、妆容贴片）；暂未接" },
+                new string[] { "KoiClothesOverlayX.KoiClothesOverlayController", null, "服装叠图；暂未接" },
+                new string[] { "KK_Plugins.MoreOutfits.MoreOutfitsController", null, "套装槽位扩展；暂未接" },
+            };
+
+            // 只有程序集、没有任何可用调用入口的插件（如实标注，避免"装了就以为能调"）。
+            // KKPE / MovUrAcc 的数据都只在 ExtSave 扩展块里、由 UI 驱动。
+            // 注意：OverlayMods / MoreOutfits 的**控制器类型**是能探测到的（见 Known），
+            // 别写在这里 —— 否则会同时出现"有控制器"和"没有调用入口"两句互相打脸的话。
+            public static readonly string[] AssemblyOnly = new string[] {
+                "KKSPE", "KKS_MovUrAcc",
+            };
+
+            private static bool AssemblyLoaded(string name)
+            {
+                try
+                {
+                    Assembly[] asms = AppDomain.CurrentDomain.GetAssemblies();
+                    for (int i = 0; i < asms.Length; i++)
+                        if (string.Equals(asms[i].GetName().Name, name, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                catch (Exception) { }
+                return false;
+            }
+
+            // 报告每个插件是否可用、以及"能不能通过本桥改动"（供 /plugins 与 /doctor 用）
+            public static List<object> Availability()
+            {
+                var list = new List<object>();
+                foreach (string[] k in Known)
+                {
+                    string typeName = k[0];
+                    Type t = Find(typeName);
+                    var d = Json.Obj("type", typeName, "present", t != null, "via", "type",
+                        "assembly", t != null && t.Assembly != null ? t.Assembly.GetName().Name : null,
+                        "bridged_op", k[1] != null ? (object)k[1] : null,
+                        "bridgeable", k[1] != null && t != null);
+                    if (k[2] != null) d["note"] = k[2];
+                    list.Add(d);
+                }
+                foreach (string a in AssemblyOnly)
+                {
+                    bool loaded = AssemblyLoaded(a);
+                    list.Add(Json.Obj("type", a, "present", loaded, "via", "assembly", "assembly", a,
+                        "bridged_op", null, "bridgeable", false,
+                        "note", loaded ? "已加载，但没有公开调用入口（数据只在 ExtSave 里、由它的 UI 驱动）" : "未加载"));
+                }
+                return list;
+            }
+
+            // ---------- MaterialEditor：任意 shader 属性 ----------
+            // MaterialAPI 的静态方法签名（实测）：
+            //   SetColor(GameObject, string materialName, string propertyName, Color) -> bool
+            //   SetFloat(GameObject, string, string, float) -> bool
+            //   SetKeyword(GameObject, string, string, bool) -> bool
+            //   GetRendererList(GameObject) -> IEnumerable<Renderer>
+            //   GetMaterials(GameObject, Renderer) -> IEnumerable<Material>
+            public static object MaterialOp(ChaControl target, Dictionary<string, object> req)
+            {
+                Type api = Find("MaterialEditorAPI.MaterialAPI");
+                if (api == null)
+                    return Json.Obj("ok", false, "error", "未安装 MaterialEditor 插件（MaterialEditorAPI.MaterialAPI 找不到）");
+                string op = Str(req, "op", "list");
+                GameObject go = target != null ? target.gameObject : null;
+                if (go == null) return Json.Obj("ok", false, "error", "没有目标角色");
+
+                if (op == "list")
+                {
+                    MethodInfo getR = api.GetMethod("GetRendererList", new Type[] { typeof(GameObject) });
+                    MethodInfo getM = api.GetMethod("GetMaterials", new Type[] { typeof(GameObject), typeof(Renderer) });
+                    if (getR == null || getM == null)
+                        return Json.Obj("ok", false, "error", "MaterialAPI 签名不符合预期（版本不兼容）");
+                    var renderers = new List<object>();
+                    IEnumerable rl = getR.Invoke(null, new object[] { go }) as IEnumerable;
+                    if (rl != null)
+                        foreach (object r in rl)
+                        {
+                            var mats = new List<object>();
+                            IEnumerable ml = getM.Invoke(null, new object[] { go, r }) as IEnumerable;
+                            if (ml != null)
+                                foreach (object m in ml)
+                                {
+                                    Material mat = m as Material;
+                                    if (mat == null) continue;
+                                    mats.Add(Json.Obj("material", mat.name, "shader", mat.shader != null ? mat.shader.name : null,
+                                        "property_count", mat.shader != null ? mat.shader.GetPropertyCount() : 0));
+                                }
+                            Renderer rr = r as Renderer;
+                            renderers.Add(Json.Obj("renderer", rr != null ? rr.name : "?", "materials", mats));
+                        }
+                    return Json.Obj("ok", true, "op", "list", "rendered_on", target.name, "renderers", renderers,
+                        "note", "下一步用 op=props 看这个 material 到底有哪些属性名（别猜 _Color，皮肤 shader 常常不是这个名字）");
+                }
+
+                // 枚举某个材质的真实 shader 属性名与当前值。
+                // 为什么必须有这个：MaterialAPI 只有 setter 没有 getter，猜属性名（_Color/_MainColor）
+                // 实测全部返回 false —— 而"改了没效果"和"属性名不存在"在只返回 bool 时无法区分。
+                if (op == "props")
+                {
+                    string materialName = Str(req, "material", null);
+                    Material mat = FindMaterial(go, materialName);
+                    if (mat == null) return Json.Obj("ok", false, "error", "找不到材质: " + materialName + "（先用 op=list）");
+                    Shader sh = mat.shader;
+                    var props = new List<object>();
+                    if (sh != null)
+                        for (int i = 0; i < sh.GetPropertyCount(); i++)
+                        {
+                            string pn = sh.GetPropertyName(i);
+                            var pi = new Dictionary<string, object>();
+                            pi["name"] = pn;
+                            try
+                            {
+                                UnityEngine.Rendering.ShaderPropertyType pt = sh.GetPropertyType(i);
+                                pi["type"] = pt.ToString();
+                                if (pt == UnityEngine.Rendering.ShaderPropertyType.Color) pi["value"] = Hex(mat.GetColor(pn));
+                                else if (pt == UnityEngine.Rendering.ShaderPropertyType.Float
+                                      || pt == UnityEngine.Rendering.ShaderPropertyType.Range) pi["value"] = (double)mat.GetFloat(pn);
+                                else if (pt == UnityEngine.Rendering.ShaderPropertyType.Vector) pi["value"] = mat.GetVector(pn).ToString();
+                                else if (pt == UnityEngine.Rendering.ShaderPropertyType.Texture)
+                                {
+                                    Texture tx = mat.GetTexture(pn);
+                                    pi["value"] = tx != null ? tx.name : null;
+                                }
+                            }
+                            catch (Exception e) { pi["value_error"] = e.Message; }
+                            props.Add(pi);
+                        }
+                    return Json.Obj("ok", true, "op", "props", "material", mat.name,
+                        "shader", sh != null ? sh.name : null, "properties", props);
+                }
+
+                if (op == "set")
+                {
+                    string materialName = Str(req, "material", null);
+                    string prop = Str(req, "property", null);
+                    if (string.IsNullOrEmpty(materialName) || string.IsNullOrEmpty(prop))
+                        return Json.Obj("ok", false, "error", "op=set 需要 material 与 property（先用 op=props 看有哪些）");
+                    object value = req.ContainsKey("value") ? req["value"] : null;
+                    if (value == null) return Json.Obj("ok", false, "error", "op=set 需要 value");
+
+                    // 先确认属性真的存在 —— 否则 SetColor 返回 false 时无法区分"名字错"和"没生效"
+                    Material mat = FindMaterial(go, materialName);
+                    if (mat == null) return Json.Obj("ok", false, "error", "找不到材质: " + materialName + "（先用 op=list）");
+                    if (!mat.HasProperty(prop))
+                        return Json.Obj("ok", false, "error", "该材质没有属性 " + prop + "（用 op=props 看真实属性名）");
+
+                    MethodInfo mi = null;
+                    object[] callArgs = null;
+                    string kind;
+                    if (value is string)
+                    {
+                        // 字符串有两义：颜色（#RRGGBB）或贴图路径（MaterialEditor 的同名重载收 Texture）
+                        Color parsed;
+                        bool isColor = TryParseColor((string)value, out parsed);
+                        if (isColor)
+                        {
+                            kind = "color";
+                            mi = api.GetMethod("SetColor", new Type[] { typeof(GameObject), typeof(string), typeof(string), typeof(Color) });
+                            callArgs = new object[] { go, materialName, prop, parsed };
+                        }
+                        else
+                        {
+                            kind = "texture";
+                            mi = api.GetMethod("SetColor", new Type[] { typeof(GameObject), typeof(string), typeof(string), typeof(string) });
+                            callArgs = new object[] { go, materialName, prop, (string)value };
+                        }
+                    }
+                    else if (value is bool)
+                    {
+                        kind = "keyword";
+                        mi = api.GetMethod("SetKeyword", new Type[] { typeof(GameObject), typeof(string), typeof(string), typeof(bool) });
+                        callArgs = new object[] { go, materialName, prop, (bool)value };
+                    }
+                    else
+                    {
+                        kind = "float";
+                        mi = api.GetMethod("SetFloat", new Type[] { typeof(GameObject), typeof(string), typeof(string), typeof(float) });
+                        callArgs = new object[] { go, materialName, prop, (float)System.Convert.ToDouble(value, CultureInfo.InvariantCulture) };
+                    }
+                    if (mi == null) return Json.Obj("ok", false, "error", "MaterialAPI 里没有匹配 " + kind + " 的重载（版本不兼容）");
+
+                    // ⚠ 关键发现：MaterialAPI.SetColor(gameObject, materialName, ...) 对**角色材质一律返回 false** ——
+                    // 实测属性确实存在（HasProperty=true）、值却读回原样、渲染也不变。
+                    // 原因：MaterialEditor 只认它自己管理的材质副本；能改且能持久化的是**角色控制器**的
+                    // SetMaterialColorProperty(slot, ObjectType, Material, prop, value, go, setProperty)。
+                    // 所以这里优先走控制器，静态 MaterialAPI 只作为退路（对非角色材质/物品物件有效）。
+                    Type ctrlType = Find("KK_Plugins.MaterialEditor.MaterialEditorCharaController");
+                    Component ctrl = ctrlType != null ? target.gameObject.GetComponent(ctrlType) : null;
+                    if (ctrl != null)
+                    {
+                        Material mat2; GameObject owner;
+                        if (FindMaterialWithOwner(target.gameObject, materialName, out mat2, out owner))
+                        {
+                            Type otType = ctrlType.GetNestedType("ObjectType");
+                            object ot = null;
+                            string otName = Str(req, "object_type", "Character");
+                            if (otType != null && otType.IsEnum)
+                            {
+                                try { ot = Enum.Parse(otType, otName, true); } catch (Exception) { }
+                                if (ot == null) ot = Enum.GetValues(otType).GetValue(0);
+                            }
+                            double? slotD = Num(req, "slot");
+                            int slot = slotD.HasValue ? (int)slotD.Value : 0;
+                            string mn = kind == "color" ? "SetMaterialColorProperty"
+                                      : (kind == "float" ? "SetMaterialFloatProperty" : "SetMaterialKeywordProperty");
+                            MethodInfo cm = null;
+                            foreach (MethodInfo m in ctrlType.GetMethods())
+                                if (m.Name == mn && m.GetParameters().Length == 7) { cm = m; break; }
+                            if (cm != null && ot != null)
+                            {
+                                object typed = kind == "color" ? (object)(Color)callArgs[3]
+                                             : (kind == "float" ? (object)(float)callArgs[3] : (object)(bool)callArgs[3]);
+                                cm.Invoke(ctrl, new object[] { slot, ot, mat2, prop, typed, owner, true });
+                                object saved = null;
+                                try
+                                {
+                                    MethodInfo gm = ctrlType.GetMethod("GetMaterial"
+                                        + (kind == "color" ? "Color" : (kind == "float" ? "Float" : "Keyword")) + "PropertyValue",
+                                        new Type[] { typeof(int), otType, typeof(Material), typeof(string), typeof(GameObject) });
+                                    if (gm != null) saved = gm.Invoke(ctrl, new object[] { slot, ot, mat2, prop, owner });
+                                }
+                                catch (Exception) { }
+                                return Json.Obj("ok", true, "op", "set", "kind", kind, "via", "MaterialEditorCharaController",
+                                    "material", materialName, "property", prop, "object_type", otName, "slot", slot,
+                                    "saved_readback", saved != null ? saved.ToString() : null,
+                                    "note", "已写入 MaterialEditor 的角色数据（随卡保存；别人没装 MaterialEditor 时看不到）");
+                            }
+                        }
+                        else return Json.Obj("ok", false, "error", "在角色的渲染器里找不到材质 " + materialName);
+                    }
+
+                    object ret = mi.Invoke(null, callArgs);
+                    bool apiOk = ret is bool && (bool)ret;
+                    return Json.Obj("ok", apiOk, "op", "set", "kind", kind, "via", "MaterialAPI(static)",
+                        "material", materialName, "property", prop, "api_returned", apiOk,
+                        "note", apiOk ? "已设置（静态入口）"
+                                      : "两个入口都没成功：该材质可能不在 MaterialEditor 的管理范围内（它管的是角色/服装/饰品/头发的材质副本）");
+                }
+
+                return Json.Obj("ok", false, "error", "op 只支持 list / props / set");
+            }
+
+            // 在角色的所有渲染器里按名字找材质（MaterialEditor 的改名/复数实例后缀要容错）
+            public static Material FindMaterial(GameObject go, string materialName)
+            {
+                Material found; GameObject owner;
+                FindMaterialWithOwner(go, materialName, out found, out owner);
+                return found;
+            }
+
+            // 同上，但把材质所属渲染器的 GameObject 一并返回 —— MaterialEditor 的控制器接口需要它
+            public static bool FindMaterialWithOwner(GameObject go, string materialName, out Material found, out GameObject owner)
+            {
+                found = null; owner = null;
+                if (go == null || string.IsNullOrEmpty(materialName)) return false;
+                Renderer[] rs = go.GetComponentsInChildren<Renderer>(true);
+                Material loose = null; GameObject looseOwner = null;
+                for (int i = 0; i < rs.Length; i++)
+                {
+                    Material[] ms = rs[i].sharedMaterials;
+                    if (ms == null) continue;
+                    for (int j = 0; j < ms.Length; j++)
+                    {
+                        Material m = ms[j];
+                        if (m == null || m.name == null) continue;
+                        if (m.name == materialName) { found = m; owner = rs[i].gameObject; return true; }
+                        if (loose == null && m.name.IndexOf(materialName, StringComparison.Ordinal) >= 0)
+                        { loose = m; looseOwner = rs[i].gameObject; }
+                    }
+                }
+                if (loose != null) { found = loose; owner = looseOwner; return true; }
+                return false;
+            }
+
+            // ---------- ABMX：逐骨骼缩放/位移/旋转 ----------
+            // 实测 API：BoneModifierData(Vector3 scale, float length, Vector3 position, Vector3 rotation)
+            //           BoneController.GetOrAddModifier(string boneName, BoneLocation location)
+            //           BoneModifier.CoordinateModifiers（每个套装一份）
+            public static object BonesOp(ChaControl target, Dictionary<string, object> req)
+            {
+                Type ctrlType = Find("KKABMX.Core.BoneController");
+                Type modType = Find("KKABMX.Core.BoneModifier");
+                Type dataType = Find("KKABMX.Core.BoneModifierData");
+                if (ctrlType == null || modType == null || dataType == null)
+                    return Json.Obj("ok", false, "error", "未安装 KKSABMX(BonemodX) 插件");
+                if (target == null) return Json.Obj("ok", false, "error", "没有目标角色");
+
+                Component ctrl = target.gameObject.GetComponent(ctrlType);
+                if (ctrl == null)
+                    return Json.Obj("ok", false, "error", "该角色上没有 BoneController（ABMX 未初始化，先把它加载进工作室再看）");
+
+                string op = Str(req, "op", "set");
+                if (op == "list")
+                {
+                    // 列出该角色所有骨骼（AI 需要知道骨骼名才能改）
+                    var names = new List<object>();
+                    Transform[] all = target.GetComponentsInChildren<Transform>(true);
+                    for (int i = 0; i < all.Length; i++) names.Add(all[i].name);
+                    return Json.Obj("ok", true, "op", "list", "count", names.Count, "bones", names,
+                        "note", "骨骼名来自运行时层级；常见：cf_J_Head / cf_J_Hand_L / cf_J_LegUp00_L 等");
+                }
+
+                List<object> list = req.ContainsKey("bones") ? req["bones"] as List<object> : null;
+                if (list == null || list.Count == 0)
+                    return Json.Obj("ok", false, "error", "需要 bones: [{name, scale:[x,y,z], length, position:[x,y,z], rotation:[x,y,z]}]");
+
+                ConstructorInfo dataCtor = dataType.GetConstructor(new Type[] { typeof(Vector3), typeof(float), typeof(Vector3), typeof(Vector3) });
+                PropertyInfo coordMods = modType.GetProperty("CoordinateModifiers");
+                MethodInfo getOrAdd = null;
+                foreach (MethodInfo m in ctrlType.GetMethods())
+                    if (m.Name == "GetOrAddModifier" && m.GetParameters().Length == 2) { getOrAdd = m; break; }
+                if (dataCtor == null || coordMods == null || getOrAdd == null)
+                    return Json.Obj("ok", false, "error", "ABMX 接口签名与预期不符（版本不兼容）");
+
+                Type locType = getOrAdd.GetParameters()[1].ParameterType;
+                object loc = null;
+                string locName = Str(req, "location", null);
+                if (!string.IsNullOrEmpty(locName))
+                {
+                    try { loc = Enum.Parse(locType, locName, true); } catch (Exception) { loc = null; }
+                }
+                if (loc == null && locType.IsEnum)
+                {
+                    // 不给就用名字里带 Body 的那个（大多数身材骨骼都在这一类下）
+                    object first = null;
+                    foreach (object v in Enum.GetValues(locType))
+                    {
+                        first = first ?? v;
+                        if (v.ToString().IndexOf("Body", StringComparison.OrdinalIgnoreCase) >= 0) { first = v; break; }
+                    }
+                    loc = first;
+                }
+
+                int coordCount = 4;
+                try
+                {
+                    PropertyInfo cm = modType.GetProperty("CoordinateModifiers");
+                    // 用现有修饰符的数组长度当基准更稳；拿不到就退回 4（vanilla 套数）
+                    object probe = null;
+                    IEnumerable all = ctrlType.GetMethod("GetAllModifiers", Type.EmptyTypes) != null
+                        ? ctrlType.GetMethod("GetAllModifiers", Type.EmptyTypes).Invoke(ctrl, null) as IEnumerable : null;
+                    if (all != null) foreach (object o in all) { probe = o; break; }
+                    if (probe != null && cm != null)
+                    {
+                        Array arr = cm.GetValue(probe, null) as Array;
+                        if (arr != null && arr.Length > 0) coordCount = arr.Length;
+                    }
+                }
+                catch (Exception) { }
+
+                var applied = new List<object>();
+                var skipped = new List<object>();
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var item = list[i] as Dictionary<string, object>;
+                    if (item == null) continue;
+                    string boneName = Str(item, "name", null);
+                    if (string.IsNullOrEmpty(boneName)) { skipped.Add(Json.Obj("item", "bones[" + i + "]", "reason", "缺 name")); continue; }
+                    bool exists = false;
+                    Transform[] all = target.GetComponentsInChildren<Transform>(true);
+                    for (int b = 0; b < all.Length; b++) if (all[b].name == boneName) { exists = true; break; }
+                    if (!exists) { skipped.Add(Json.Obj("item", boneName, "reason", "该角色没有这根骨骼（先 op=list 看骨骼名）")); continue; }
+
+                    try
+                    {
+                        Vector3 scale = VecOf(item, "scale", Vector3.one);
+                        Vector3 pos = VecOf(item, "position", Vector3.zero);
+                        Vector3 rot = VecOf(item, "rotation", Vector3.zero);
+                        double? len = Num(item, "length");
+                        float length = len.HasValue ? (float)len.Value : 1f;
+
+                        object mod = getOrAdd.Invoke(ctrl, new object[] { boneName, loc });
+                        var datas = new object[coordCount];
+                        for (int c = 0; c < coordCount; c++)
+                            datas[c] = dataCtor.Invoke(new object[] { scale, length, pos, rot });
+                        Array typed = Array.CreateInstance(dataType, coordCount);
+                        for (int c = 0; c < coordCount; c++) typed.SetValue(datas[c], c);
+                        coordMods.SetValue(mod, typed, null);
+
+                        // 改完要让它重算：BoneController.NeedsFullRefresh
+                        PropertyInfo nfr = ctrlType.GetProperty("NeedsFullRefresh");
+                        if (nfr != null && nfr.CanWrite) nfr.SetValue(ctrl, true, null);
+
+                        applied.Add(Json.Obj("item", boneName, "scale", scale.ToString(), "length", (double)length,
+                            "position", pos.ToString(), "rotation", rot.ToString(), "coordinates", coordCount));
+                    }
+                    catch (Exception e)
+                    {
+                        skipped.Add(Json.Obj("item", boneName, "reason", e.InnerException != null ? e.InnerException.Message : e.Message));
+                    }
+                }
+                return Json.Obj("ok", applied.Count > 0, "op", "set", "location", loc != null ? loc.ToString() : null,
+                    "coordinate_count", coordCount, "applied", applied, "skipped", skipped,
+                    "note", "数据存进 ABMX 的扩展块（随卡保存需装 ABMX）；scale 是倍率（1=不变），单位骨骼才能看出效果");
+            }
+
+            private static Vector3 VecOf(Dictionary<string, object> d, string key, Vector3 def)
+            {
+                object v;
+                if (d == null || !d.TryGetValue(key, out v) || v == null) return def;
+                List<object> arr = v as List<object>;
+                Vector3 outv = def;
+                if (arr != null)
+                {
+                    if (arr.Count > 0) outv.x = (float)System.Convert.ToDouble(arr[0], CultureInfo.InvariantCulture);
+                    if (arr.Count > 1) outv.y = (float)System.Convert.ToDouble(arr[1], CultureInfo.InvariantCulture);
+                    if (arr.Count > 2) outv.z = (float)System.Convert.ToDouble(arr[2], CultureInfo.InvariantCulture);
+                    return outv;
+                }
+                Dictionary<string, object> dd = v as Dictionary<string, object>;
+                if (dd != null)
+                {
+                    object o;
+                    if (dd.TryGetValue("x", out o)) outv.x = (float)System.Convert.ToDouble(o, CultureInfo.InvariantCulture);
+                    if (dd.TryGetValue("y", out o)) outv.y = (float)System.Convert.ToDouble(o, CultureInfo.InvariantCulture);
+                    if (dd.TryGetValue("z", out o)) outv.z = (float)System.Convert.ToDouble(o, CultureInfo.InvariantCulture);
+                }
+                return outv;
             }
         }
 

@@ -76,7 +76,7 @@ kks_status          → 看进程/场景/FPS
 
 ## MCP 工具
 
-22 个，按用途分组。
+25 个，按用途分组。
 
 **状态与诊断**
 
@@ -123,7 +123,15 @@ kks_status          → 看进程/场景/FPS
 |---|---|
 | `kks_clear` | 清空工作室角色（可传 `name` 只清某一类） |
 | `kks_txn` | 快照/回滚：`snapshot` / `list` / `restore` / `drop` |
-| `kks_help` | 长尾文档：`workflow` / `params` / `acceptance` / `verify`（证据纪律）/ `pitfalls` / `reference` |
+| `kks_help` | 长尾文档：`workflow` / `params` / `acceptance` / `verify`（证据纪律）/ `pitfalls` / `reference` / `plugins` |
+
+**借道第三方插件**
+
+| 工具 | 作用 |
+|---|---|
+| `kks_plugins` | 探测制作类插件：`present`（装没装）+ `bridged_op`（能否经本桥改）。**借道前先问它** |
+| `kks_material` | 借 MaterialEditor 改任意 shader 属性（`op=list/props/set`；`props` 必须先用，别猜属性名） |
+| `kks_bones` | 借 KKSABMX 逐骨骼缩放/位移/旋转（`op=list` 拿 979 根骨骼名，`op=set` 改） |
 
 ## 生成参数
 
@@ -164,7 +172,7 @@ kks_status          → 看进程/场景/FPS
 
 ## 桥接 HTTP 端点
 
-22 个，MCP 工具是它们的薄封装（`kks_launch` 除外，它只在本机拉起进程）。
+25 个，MCP 工具是它们的薄封装（`kks_launch` 除外，它只在本机拉起进程）。
 
 | 端点 | 说明 |
 |---|---|
@@ -174,6 +182,7 @@ kks_status          → 看进程/场景/FPS
 | `POST /generate` `/clear` `/txn` | 生成、清场、快照回滚 |
 | `GET /capture` `POST /capture` `/screenshot` `/focus` | 截图与相机 |
 | `POST /reference` `/compare` `/fit` | 数值闭环 |
+| `GET /plugins` `POST /material` `/bones` | 借道第三方插件（探测 / 材质 / 骨骼） |
 
 ## 设计要点（把踩过的坑说清楚）
 
@@ -294,6 +303,66 @@ try/finally 兜底（异常时还原发型、清理临时卡，并把异常落�
 | 腰腹/裙腰 | `framing:"torso"` |
 | 任意部位 | `from`/`look_at` 给世界坐标 |
 
+### 游戏内"修改器"能改更多：查清差集在哪
+
+一个很直接的观察：游戏内制作器 + 装的一堆插件，能改的东西明显比本工具多。查清后发现差距分三层，
+性质完全不同——**只有第三层是真的缺功能**。
+
+**第一层：字段早就能写，只是从没暴露（纯文档问题）。** `Applier.Apply` 是按成员名**反射**写入的，
+任何公开成员都能写。实测官方卡成员面：`face` **39 个**、`body` **25 个**，而文档只写了约 8 + 7 个。
+漏掉的包括眼白 `whiteId/whiteBaseColor`、高光上下分开（`hlUp*` 之外还有 `hlDown*`）、
+上下眼线分开 + 粗细 `eyelineUpId/eyelineDownId/eyelineUpWeight`、泪痣 `moleId`、
+瞳孔位置大小 `pupilX/Y/Width/Height`、八重歯 `doubleTooth`、骨骼类型 `typeBone`、
+体毛 `underhairId`、身体涂装两槽 `paintId[]/paintColor[]`、乳首 `nipId/nipGlossPower/areolaSize`、
+描画顺序 `foregroundEyebrow/foregroundEyes`……现在全写进了 `kks_help params`。
+
+**第二层：转换器缺类型。** `Convert()` 原来只认 float/int/byte/bool/string/Color/float[]/enum，
+于是 `Vector2/3/4` 与 `bool[]` 一律报"不支持的目标类型"。补上后一次解锁：
+花纹的 `tiling/offset/rotate`（Vector2）、饰品位移 `addMove` 与发区 `pos/rot/scl`（Vector3）、
+痣与涂装定位（Vector4）、服装 `hideOpt` 与饰品 `showAccessory`（bool[]）。
+
+**第三层：结构性缺口。**
+- **多套服装**：卡片有 4 套坐标，之前只写当前那套 → 新增 `coordinate:N` 与 `all_coordinates:true`。
+  顺带查清 `clothesState` 只有 9 项、**不分坐标**（全局），所以写别的套数时不动状态。
+- **异色瞳**：双眼数据本来就独立（`face.pupil[2]`），之前却把同一份写给两只眼 →
+  现在 `pupil` 传数组即左右分设。实测渲染确实不同色（右半 673 红/0 绿，左半以绿为主）。
+  `isPupilSameSetting` 是只读属性，写它会明确报"属性只读"，但不影响异色瞳生效。
+- **人格问卷**：`attribute/awnser/denial/interest` 是嵌套对象 → 给 Applier 加了嵌套递归
+  （只对引用类型递归：值类型拿到的是副本，写进去不生效）。
+
+**顺带抓到一个真 bug**：`ApplySmoothSkin` 的面部那段是**无条件**执行的（只有 body 段受
+`smooth_skin` 控制），于是每生成一次就把官方脸的 `detailPower` 清零——而官方 お嬢様 实测是
+**0.449**（脸部本来有凹凸细节）；它还跑在通用 apply 之后，用户显式传的值也会被覆盖。
+改成整段受 `smooth_skin` 控制。验证（官方卡当基底）：默认 → 继承 0.449；`smooth_skin:true` → 0。
+
+### 借道第三方插件
+
+本机装了约 140 个插件，十几个扩展的是人物制作能力。逐个体检（Cecil 读 IL 元数据）后分两类：
+有公开 API 的、和只有 UI 的。接通的走**运行时反射**——不硬引用它们的 DLL（没装的机器上会编译失败），
+装了就用，没装就如实报错。
+
+| 端点 | 插件 | 能力 |
+|---|---|---|
+| `/material` · `kks_material` | MaterialEditor | 改**任意 shader 属性**：皮肤质感、光泽、颜色叠加层（vanilla 数据模型里没有的维度） |
+| `/bones` · `kks_bones` | KKSABMX (BonemodX) | **逐骨骼**缩放/位移/旋转，比 44 个形状滑条细得多（实测 979 根骨骼） |
+
+两个都按"改完拍图看 md5 变没变"验证，而不是只信返回值：`_overcolor1` 改绿 → 渲染 md5 改变、
+读回 `RGBA(0,1,0,1)`；`cf_j_head` 放大 1.35 → 渲染 md5 改变。
+
+**坑（值得单独记）**：`MaterialAPI.SetColor(gameObject, materialName, ...)` 这个静态入口对
+**角色材质一律返回 false**——属性明明存在（`HasProperty=true`）、值读回原样、渲染也不变，
+因为它只认 MaterialEditor 自己管理的材质副本。正确入口是角色控制器的
+`MaterialEditorCharaController.SetMaterialColorProperty(slot, ObjectType, material, prop, value, go, setProperty)`。
+另外 `op=props`（列真实属性名）是必需的：本机皮肤 shader 是 `Koikano/main_skin`，
+属性叫 `_overcolor1` / `_SpecularColor` / `_SpecularPower`——猜 `_Color` 只会得到 false。
+
+**探测到但没接**（`/plugins` 里标 `bridgeable=false`，避免"检测到插件"被误读成"这能力能用"）：
+MoreAccessories（槽位扩展，接口挂在 UI 实例上）、KKPE、MovUrAcc（数据只在 ExtSave 里、由 UI 驱动，
+且本机未加载）、OverlayMods（叠图/纹身）、MoreOutfits（套装槽位）。
+
+**代价（必须知道）**：这些数据都存在 `KKS_ExtensibleSaveFormat` 扩展块里。借道生成的卡，
+在**没装对应插件的人**那里会退化成 vanilla 外观。
+
 ### "改了参数没效果"怎么排查
 
 按这个顺序，能定位到具体哪一层断掉：
@@ -386,13 +455,16 @@ try/finally 兜底（异常时还原发型、清理临时卡，并把异常落�
 3. **写租约（lease）**：多会话并发写保护
 4. **自动化回归**：把工具名/数量钉死的测试（现在 `kks_selftest` 是能力锁 + 手工验证脚本）
 5. **通道与 skill 分离**：把"按参考图生成人物"的流程与验收写成独立 skill
+6. **继续借道插件**：MoreAccessories（饰品槽位，接口在 UI 实例上，需要再挖一层）、
+   OverlayMods（叠图/纹身，控制器已能探测到）、MoreOutfits（套装槽位）；
+   以及给借道数据加"没装插件时的降级提示"（现在只在返回里说明，不阻止生成）
 
 ## 目录结构
 
 ```
 KKS_AICharMCP/
-├─ BridgePlugin/AICharBridge.cs    游戏内插件源码（22 端点）
-├─ kks_chara_mcp.py                MCP 服务器（22 工具，仅标准库）
+├─ BridgePlugin/AICharBridge.cs    游戏内插件源码（25 端点）
+├─ kks_chara_mcp.py                MCP 服务器（25 工具，仅标准库）
 ├─ build_bridge.bat                编译脚本（KKS_HOME 可配）
 ├─ tools/                          验证脚本与探针
 └─ README.md
