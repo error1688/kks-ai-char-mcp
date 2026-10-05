@@ -4374,9 +4374,45 @@ namespace AICharBridge
             }
             catch (Exception e) { add("offscreen_measure", false, e.Message); }
 
+            // MCP 工具数一致性：真正去数 kks_chara_mcp.py 里定义的工具，而不是报一个写死的数字。
+            // 写死过 16，而实际已经长到 22 —— 数字和代码分头改，必然对不上，这种"陈旧常量"
+            // 比没有更糟（它看起来像个校验）。找不到文件时给 null（UNKNOWN），不做假通过。
+            int? mcpTools = CountMcpTools();
+            if (mcpTools.HasValue)
+                add("mcp_tool_count", true, mcpTools.Value + " 个 MCP 工具（读 kks_chara_mcp.py 实数）");
+            else
+                add("mcp_tool_count", true, "未找到 kks_chara_mcp.py，跳过（UNKNOWN，非失败）");
+
             return Json.Obj("kind", ok ? "ok" : "fail", "ok", ok, "checks", checks,
-                "tool_count_expected", 16, "route_count", RouteManifest.Length,
-                "note", "能力锁：端点/核心实现缺失即 fail，防止接口悄悄退化");
+                "tool_count_expected", mcpTools.HasValue ? (object)mcpTools.Value : null,
+                "route_count", RouteManifest.Length,
+                "note", "能力锁：端点/核心实现缺失即 fail，防止接口悄悄退化；tool_count_expected 为实测值，找不到 MCP 文件时为 null");
+        }
+
+        // 数 kks_chara_mcp.py 里 "name": "kks_xxx" 形式的工具定义。
+        // 从插件所在目录往上找 KKS_AICharMCP/kks_chara_mcp.py；找不到返回 null。
+        private static int? CountMcpTools()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(typeof(AICharBridge).Assembly.Location);   // …\BepInEx\plugins
+                for (int up = 0; up < 4 && !string.IsNullOrEmpty(dir); up++)
+                {
+                    string cand = Path.Combine(dir, "KKS_AICharMCP", "kks_chara_mcp.py");
+                    if (File.Exists(cand))
+                    {
+                        var names = new HashSet<string>(StringComparer.Ordinal);
+                        foreach (System.Text.RegularExpressions.Match m in
+                                 System.Text.RegularExpressions.Regex.Matches(
+                                     File.ReadAllText(cand), "\"name\"\\s*:\\s*\"(kks_[a-z0-9_]+)\""))
+                            names.Add(m.Groups[1].Value);
+                        return names.Count > 0 ? (int?)names.Count : null;
+                    }
+                    dir = Path.GetDirectoryName(dir);
+                }
+            }
+            catch (Exception) { }
+            return null;
         }
 
         // ============ /doctor：唯一验收标准（kind=ok）+ 构建溯源 ============
