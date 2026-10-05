@@ -1,0 +1,35 @@
+# ---- 构建产物：不进仓库（由 build_bridge.bat 生成）----
+*.dll
+*.exe
+*.pdb
+[Bb]in/
+[Oo]bj/
+
+# ---- 调试产物 / 会话转录：不进仓库 ----
+# tools/ 里保留可复用的验证脚本（test_*.py / whale*.py / final*.py / *.cs 探针），
+# 但排除一次性的中间产物与临时编辑脚本。
+tools/*.jsonl
+tools/*.txt
+tools/*.log
+tools/*.png
+tools/*.jpg
+tools/dump*.ps1
+tools/patch_*.py
+tools/cecil_probe*.exe
+
+# ---- 游戏本体 / 存档：绝不入库（含版权资源与本地数据）----
+UserData/
+chara/
+*.png.bak
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 编辑器 / 系统 ----
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
